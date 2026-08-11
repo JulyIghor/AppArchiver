@@ -1,0 +1,829 @@
+#!/bin/bash
+# Copyright (c) Ihor July
+# https://apparchiver.com
+# SPDX-License-Identifier: MIT
+#
+# App Archiver external operations helper.
+#
+# Installed by the user into:
+#   ~/Library/Application Scripts/com.apparchiver.mac/AppArchiverScript
+#
+# This helper performs the narrow operations that App Sandbox cannot perform.
+# It removes quarantine from generated shortcut bundles and verified restored
+# app staging, creates disposable filesystem-compressed app copies, and safely
+# extracts one app from authenticated disk image staging.
+
+set -u
+set -o pipefail
+PATH="/usr/bin:/bin:/usr/sbin:/sbin"
+export PATH
+
+readonly SCRIPT_NAME="AppArchiverScript"
+readonly SCRIPT_VERSION="15"
+readonly XATTR_PATH="/usr/bin/xattr"
+readonly FIND_PATH="/usr/bin/find"
+readonly PLISTBUDDY_PATH="/usr/libexec/PlistBuddy"
+readonly PLUTIL_PATH="/usr/bin/plutil"
+readonly DITTO_PATH="/usr/bin/ditto"
+readonly CHFLAGS_PATH="/usr/bin/chflags"
+readonly HDIUTIL_PATH="/usr/bin/hdiutil"
+readonly STAT_PATH="/usr/bin/stat"
+readonly ID_PATH="/usr/bin/id"
+readonly GREP_PATH="/usr/bin/grep"
+readonly TR_PATH="/usr/bin/tr"
+readonly RESTORE_MARKER_NAME=".AppArchiver-Restore-Authorization.plist"
+readonly RESTORE_MARKER_VERSION="4"
+
+DMG_MOUNT_POINT=""
+DMG_EXTRACTION_DESTINATION=""
+
+cleanup_dmg_extraction() {
+    if [ -n "$DMG_EXTRACTION_DESTINATION" ]; then
+        /bin/rm -rf "$DMG_EXTRACTION_DESTINATION" >/dev/null 2>&1 || true
+        DMG_EXTRACTION_DESTINATION=""
+    fi
+    if [ -n "$DMG_MOUNT_POINT" ]; then
+        "$HDIUTIL_PATH" detach "$DMG_MOUNT_POINT" >/dev/null 2>&1 || true
+        /bin/rmdir "$DMG_MOUNT_POINT" >/dev/null 2>&1 || true
+        DMG_MOUNT_POINT=""
+    fi
+}
+
+trap cleanup_dmg_extraction EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+print_kv() {
+    printf '%s=%s\n' "$1" "$2"
+}
+
+print_error_and_exit() {
+    print_kv "status" "error"
+    print_kv "error" "$1"
+    exit "${2:-1}"
+}
+
+is_app_bundle() {
+    local target="${1:-}"
+    [ -d "$target" ] || return 1
+    [[ "$target" == *.app ]] || return 1
+    [ -d "$target/Contents" ] || return 1
+    return 0
+}
+
+bundle_identifier() {
+    local target="${1:-}"
+    "$PLISTBUDDY_PATH" -c "Print CFBundleIdentifier" "$target/Contents/Info.plist" 2>/dev/null || true
+}
+
+is_archived_placeholder() {
+    local target="${1:-}"
+    local placeholder
+    local bundle_id
+    placeholder="$("$PLISTBUDDY_PATH" -c "Print AppArchiverPlaceholder" "$target/Contents/Info.plist" 2>/dev/null || true)"
+    bundle_id="$(bundle_identifier "$target")"
+    [ "$placeholder" = "true" ] || return 1
+    [[ "$bundle_id" == com.apparchiver.archive.* ]] || return 1
+    [ -f "$target/Contents/Resources/AppArchiverArchive/metadata.json" ] || return 1
+    [ -f "$target/Contents/Resources/AppArchiverArchive/OriginalApp.apparchive" ] || return 1
+    return 0
+}
+
+physical_existing_path() {
+    local target="${1:-}"
+    local parent
+    local name
+    local physical_parent
+
+    [ -n "$target" ] || return 1
+    [[ "$target" == /* ]] || return 1
+    case "$target" in
+    *$'\n'* | *$'\r'*)
+        return 1
+        ;;
+    esac
+    target="${target%/}"
+    parent="${target%/*}"
+    name="${target##*/}"
+    [ -n "$name" ] || return 1
+    [ "$parent" != "$target" ] || return 1
+    physical_parent="$(cd -P "$parent" 2>/dev/null && pwd -P)" || return 1
+    if [ "$physical_parent" = "/" ]; then
+        printf '/%s\n' "$name"
+    else
+        printf '%s/%s\n' "$physical_parent" "$name"
+    fi
+}
+
+remove_quarantine_recursively_fast() {
+    local target="${1:-}"
+    [ -n "$target" ] || return 1
+
+    "$FIND_PATH" -P "$target" -xdev \( -type f -o -type d \) -print0 \
+        >/dev/null 2>&1 || return 1
+
+    # Missing attributes make xattr return a failure status even though there
+    # is nothing to remove. Process regular files and directories in ARG_MAX
+    # sized batches, then let the caller verify the result independently.
+    "$FIND_PATH" -P "$target" -xdev \( -type f -o -type d \) \
+        -exec "$XATTR_PATH" -d -s com.apple.quarantine {} + \
+        >/dev/null 2>&1 || true
+    return 0
+}
+
+verify_quarantine_is_absent_recursively() {
+    local target="${1:-}"
+    [ -n "$target" ] || return 1
+
+    "$FIND_PATH" -P "$target" -xdev \( -type f -o -type d \) -print0 2>/dev/null |
+        while IFS= read -r -d '' item; do
+            local attributes
+            local attribute
+            attributes="$("$XATTR_PATH" -s "$item" 2>/dev/null)" || exit 1
+            while IFS= read -r attribute; do
+                if [ "$attribute" = "com.apple.quarantine" ]; then
+                    exit 1
+                fi
+            done <<<"$attributes"
+            true
+        done
+}
+
+root_attribute_is_present() {
+    local target="${1:-}"
+    local attribute_name="${2:-}"
+    local attributes
+    attributes="$("$XATTR_PATH" -s "$target" 2>/dev/null)" || return 2
+    while IFS= read -r attribute; do
+        [ "$attribute" = "$attribute_name" ] && return 0
+    done <<<"$attributes"
+    return 1
+}
+
+restore_root_security_attribute() {
+    local target="${1:-}"
+    local attribute_name="${2:-}"
+    local should_be_present="${3:-false}"
+    local expected_hex="${4:-}"
+
+    "$XATTR_PATH" -d -s "$attribute_name" "$target" \
+        >/dev/null 2>&1 || true
+    if [ "$should_be_present" = "true" ]; then
+        "$XATTR_PATH" -wx "$attribute_name" "$expected_hex" "$target" \
+            >/dev/null 2>&1 || return 1
+        local actual_hex
+        actual_hex="$("$XATTR_PATH" -px "$attribute_name" "$target" 2>/dev/null |
+            "$TR_PATH" -d '[:space:]' |
+            "$TR_PATH" '[:upper:]' '[:lower:]')" || return 1
+        [ "$actual_hex" = "$expected_hex" ] || return 1
+        return 0
+    fi
+
+    root_attribute_is_present "$target" "$attribute_name"
+    local presence_status=$?
+    [ "$presence_status" -eq 1 ]
+}
+
+approve_bundle() {
+    local target="${1:-}"
+    target="${target%/}"
+
+    [ -n "$target" ] || print_error_and_exit "Missing app bundle path." 64
+    is_app_bundle "$target" || print_error_and_exit "Target is not an app bundle." 65
+    is_archived_placeholder "$target" || print_error_and_exit "Target is not an App Archiver restorable app." 65
+
+    local bundle_id
+    bundle_id="$(bundle_identifier "$target")"
+    [ -n "$bundle_id" ] || print_error_and_exit "Target is missing a bundle identifier." 66
+
+    remove_quarantine_recursively_fast "$target" ||
+        print_error_and_exit "The generated app's launch restriction could not be removed." 67
+    verify_quarantine_is_absent_recursively "$target" ||
+        print_error_and_exit "The generated app's launch restriction could not be removed." 67
+
+    print_kv "status" "ok"
+    print_kv "script_version" "$SCRIPT_VERSION"
+    print_kv "bundle_id" "$bundle_id"
+}
+
+prepare_restored_bundle() {
+    local operation="${1:-}"
+    local placeholder="${2:-}"
+    local restored="${3:-}"
+    local marker="${4:-}"
+    local authorization_token="${5:-}"
+    placeholder="${placeholder%/}"
+    restored="${restored%/}"
+    marker="${marker%/}"
+
+    [ "$operation" = "prepare-restored" ] ||
+        [ "$operation" = "prepare-relocated" ] ||
+        [ "$operation" = "prepare-installed" ] ||
+        print_error_and_exit "The restoration helper operation is invalid." 64
+    [ -n "$placeholder" ] || print_error_and_exit "Missing archived app path." 64
+    [ -n "$restored" ] || print_error_and_exit "Missing restored app path." 64
+    [ -n "$marker" ] || print_error_and_exit "Missing restoration authorization marker." 64
+    [[ "$authorization_token" =~ ^[0-9a-f]{64}$ ]] ||
+        print_error_and_exit "The restoration authorization token is invalid." 65
+    [ ! -L "$placeholder" ] || print_error_and_exit "The archived app cannot be a symbolic link." 65
+    [ ! -L "$restored" ] || print_error_and_exit "The restored app cannot be a symbolic link." 65
+    [ ! -L "$marker" ] || print_error_and_exit "The restoration authorization marker cannot be a symbolic link." 65
+    is_app_bundle "$placeholder" || print_error_and_exit "The archived app is invalid." 65
+    is_archived_placeholder "$placeholder" || print_error_and_exit "The archived app is not an App Archiver restorable app." 65
+    is_app_bundle "$restored" || print_error_and_exit "The restored app staging is invalid." 65
+    [ -f "$marker" ] || print_error_and_exit "The restoration authorization marker is invalid." 65
+    [ "${marker##*/}" = "$RESTORE_MARKER_NAME" ] ||
+        print_error_and_exit "The restoration authorization marker name is invalid." 65
+
+    local marker_size
+    local marker_mode
+    local marker_owner
+    local marker_links
+    marker_size="$("$STAT_PATH" -f '%z' "$marker" 2>/dev/null)" ||
+        print_error_and_exit "The restoration authorization marker could not be inspected." 66
+    marker_mode="$("$STAT_PATH" -f '%Lp' "$marker" 2>/dev/null)" ||
+        print_error_and_exit "The restoration authorization marker permissions could not be inspected." 66
+    marker_owner="$("$STAT_PATH" -f '%u' "$marker" 2>/dev/null)" ||
+        print_error_and_exit "The restoration authorization marker owner could not be inspected." 66
+    marker_links="$("$STAT_PATH" -f '%l' "$marker" 2>/dev/null)" ||
+        print_error_and_exit "The restoration authorization marker links could not be inspected." 66
+    [[ "$marker_size" =~ ^[0-9]+$ ]] ||
+        print_error_and_exit "The restoration authorization marker size is invalid." 65
+    [ "$marker_size" -gt 0 ] && [ "$marker_size" -le 65536 ] ||
+        print_error_and_exit "The restoration authorization marker size is invalid." 65
+    [[ "$marker_mode" =~ ^[0-7]{3}$ ]] ||
+        print_error_and_exit "The restoration authorization marker permissions are invalid." 65
+    local marker_mode_value
+    marker_mode_value=$((8#$marker_mode))
+    [ $((marker_mode_value & 0600)) -eq $((0600)) ] &&
+        [ $((marker_mode_value & 0022)) -eq 0 ] ||
+        print_error_and_exit "The restoration authorization marker permissions are invalid." 65
+    [ "$marker_owner" = "$("$ID_PATH" -u)" ] ||
+        print_error_and_exit "The restoration authorization marker owner is invalid." 65
+    [ "$marker_links" = "1" ] ||
+        print_error_and_exit "The restoration authorization marker links are invalid." 65
+    "$GREP_PATH" -F -q '<plist version="1.0">' "$marker" 2>/dev/null ||
+        print_error_and_exit "The restoration authorization marker is not an XML property list." 65
+    [ "$("$PLUTIL_PATH" -type MarkerVersion "$marker" 2>/dev/null)" = "integer" ] ||
+        print_error_and_exit "The restoration authorization marker version has an invalid type." 65
+    local marker_string_key
+    for marker_string_key in Token Operation PlaceholderPath AuthorizedPlaceholderDevice AuthorizedPlaceholderInode AuthorizedRestoredPath AuthorizedDevice AuthorizedInode ArchiveIdentifier RestoredFileName OriginalBundleIdentifier QuarantineValueHex ProvenanceValueHex; do
+        [ "$("$PLUTIL_PATH" -type "$marker_string_key" "$marker" 2>/dev/null)" = "string" ] ||
+            print_error_and_exit "The restoration authorization marker contains an invalid value type." 65
+    done
+    local marker_bool_key
+    for marker_bool_key in SecurityStateSpecified QuarantinePresent ProvenancePresent; do
+        [ "$("$PLUTIL_PATH" -type "$marker_bool_key" "$marker" 2>/dev/null)" = "bool" ] ||
+            print_error_and_exit "The restoration authorization marker contains an invalid value type." 65
+    done
+
+    local script_directory_path
+    local script_directory
+    script_directory_path="${0%/*}"
+    [ "$script_directory_path" != "$0" ] ||
+        print_error_and_exit "The App Archiver helper location is invalid." 65
+    script_directory="$(cd -P "$script_directory_path" 2>/dev/null && pwd -P)" ||
+        print_error_and_exit "The App Archiver helper location could not be resolved." 66
+    case "$script_directory" in
+    */Library/Application\ Scripts/com.apparchiver.mac)
+        ;;
+    *)
+        print_error_and_exit "The App Archiver helper is not installed in its expected folder." 65
+        ;;
+    esac
+    local placeholder_physical
+    local restored_physical
+    local marker_physical
+    local restored_parent
+    local placeholder_parent
+    local marker_parent
+    placeholder_physical="$(physical_existing_path "$placeholder")" ||
+        print_error_and_exit "The archived app path could not be resolved." 66
+    restored_physical="$(physical_existing_path "$restored")" ||
+        print_error_and_exit "The restored app path could not be resolved." 66
+    marker_physical="$(physical_existing_path "$marker")" ||
+        print_error_and_exit "The restoration authorization marker path could not be resolved." 66
+    restored_parent="${restored_physical%/*}"
+    placeholder_parent="${placeholder_physical%/*}"
+    marker_parent="${marker_physical%/*}"
+    if [ "$operation" = "prepare-restored" ]; then
+        [ "$restored_parent" = "$marker_parent" ] ||
+            print_error_and_exit "The restored app and authorization marker are not in the same private workspace." 65
+    elif [ "$operation" = "prepare-relocated" ]; then
+        [ "$restored_parent" = "$placeholder_parent" ] ||
+            print_error_and_exit "The relocated restored app is not beside the archived app." 65
+        [[ "${restored_physical##*/}" =~ ^\.AppArchiver-Restored-[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}\.app$ ]] ||
+            print_error_and_exit "The relocated restored app name is invalid." 65
+    else
+        [ "$restored_parent" = "$placeholder_parent" ] ||
+            print_error_and_exit "The installed restored app is not beside the archived launcher." 65
+        [[ "${placeholder_physical##*/}" =~ ^\.AppArchiver-Restored-[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}\.app$ ]] ||
+            print_error_and_exit "The archived launcher exchange name is invalid." 65
+    fi
+    [ "$placeholder_physical" != "$restored_physical" ] ||
+        print_error_and_exit "The restored and archived app paths must be different." 65
+
+    local marker_version
+    local marker_token
+    local marker_operation
+    local marker_placeholder_path
+    local marker_authorized_placeholder_device
+    local marker_authorized_placeholder_inode
+    local marker_authorized_restored_path
+    local marker_authorized_device
+    local marker_authorized_inode
+    local marker_archive_identifier
+    local marker_restored_file_name
+    local marker_original_bundle_id
+    local marker_security_state_specified
+    local marker_quarantine_present
+    local marker_quarantine_hex
+    local marker_provenance_present
+    local marker_provenance_hex
+    marker_version="$("$PLISTBUDDY_PATH" -c "Print MarkerVersion" "$marker" 2>/dev/null)" ||
+        print_error_and_exit "The restoration authorization marker version is missing." 66
+    marker_token="$("$PLISTBUDDY_PATH" -c "Print Token" "$marker" 2>/dev/null)" ||
+        print_error_and_exit "The restoration authorization token is missing." 66
+    marker_operation="$("$PLISTBUDDY_PATH" -c "Print Operation" "$marker" 2>/dev/null)" ||
+        print_error_and_exit "The restoration authorization operation is missing." 66
+    marker_placeholder_path="$("$PLISTBUDDY_PATH" -c "Print PlaceholderPath" "$marker" 2>/dev/null)" ||
+        print_error_and_exit "The archived app authorization path is missing." 66
+    marker_authorized_placeholder_device="$("$PLISTBUDDY_PATH" -c "Print AuthorizedPlaceholderDevice" "$marker" 2>/dev/null)" ||
+        print_error_and_exit "The archived app authorization device is missing." 66
+    marker_authorized_placeholder_inode="$("$PLISTBUDDY_PATH" -c "Print AuthorizedPlaceholderInode" "$marker" 2>/dev/null)" ||
+        print_error_and_exit "The archived app authorization inode is missing." 66
+    marker_authorized_restored_path="$("$PLISTBUDDY_PATH" -c "Print AuthorizedRestoredPath" "$marker" 2>/dev/null)" ||
+        print_error_and_exit "The restored app authorization path is missing." 66
+    marker_authorized_device="$("$PLISTBUDDY_PATH" -c "Print AuthorizedDevice" "$marker" 2>/dev/null)" ||
+        print_error_and_exit "The restored app authorization device is missing." 66
+    marker_authorized_inode="$("$PLISTBUDDY_PATH" -c "Print AuthorizedInode" "$marker" 2>/dev/null)" ||
+        print_error_and_exit "The restored app authorization inode is missing." 66
+    marker_archive_identifier="$("$PLISTBUDDY_PATH" -c "Print ArchiveIdentifier" "$marker" 2>/dev/null)" ||
+        print_error_and_exit "The archive authorization identity is missing." 66
+    marker_restored_file_name="$("$PLISTBUDDY_PATH" -c "Print RestoredFileName" "$marker" 2>/dev/null)" ||
+        print_error_and_exit "The restored app authorization name is missing." 66
+    marker_original_bundle_id="$("$PLISTBUDDY_PATH" -c "Print OriginalBundleIdentifier" "$marker" 2>/dev/null)" ||
+        print_error_and_exit "The restored app authorization identity is missing." 66
+    marker_security_state_specified="$("$PLISTBUDDY_PATH" -c "Print SecurityStateSpecified" "$marker" 2>/dev/null)" ||
+        print_error_and_exit "The launch-security authorization state is missing." 66
+    marker_quarantine_present="$("$PLISTBUDDY_PATH" -c "Print QuarantinePresent" "$marker" 2>/dev/null)" ||
+        print_error_and_exit "The quarantine authorization state is missing." 66
+    marker_quarantine_hex="$("$PLISTBUDDY_PATH" -c "Print QuarantineValueHex" "$marker" 2>/dev/null)" ||
+        print_error_and_exit "The quarantine authorization value is missing." 66
+    marker_provenance_present="$("$PLISTBUDDY_PATH" -c "Print ProvenancePresent" "$marker" 2>/dev/null)" ||
+        print_error_and_exit "The provenance authorization state is missing." 66
+    marker_provenance_hex="$("$PLISTBUDDY_PATH" -c "Print ProvenanceValueHex" "$marker" 2>/dev/null)" ||
+        print_error_and_exit "The provenance authorization value is missing." 66
+
+    [ "$marker_version" = "$RESTORE_MARKER_VERSION" ] ||
+        print_error_and_exit "The restoration authorization marker version is unsupported." 65
+    [ "$marker_token" = "$authorization_token" ] ||
+        print_error_and_exit "The restoration authorization token does not match." 65
+    [ "$marker_operation" = "$operation" ] ||
+        print_error_and_exit "The restoration authorization operation does not match." 65
+    [ "$marker_placeholder_path" = "$placeholder_physical" ] ||
+        print_error_and_exit "The restoration authorization does not match the archived app path." 65
+    [[ "$marker_authorized_placeholder_device" =~ ^[0-9]+$ ]] ||
+        print_error_and_exit "The archived app authorization device is invalid." 65
+    [[ "$marker_authorized_placeholder_inode" =~ ^[0-9]+$ ]] ||
+        print_error_and_exit "The archived app authorization inode is invalid." 65
+    local placeholder_device
+    local placeholder_inode
+    placeholder_device="$("$STAT_PATH" -f '%d' "$placeholder" 2>/dev/null)" ||
+        print_error_and_exit "The archived app device could not be inspected." 66
+    placeholder_inode="$("$STAT_PATH" -f '%i' "$placeholder" 2>/dev/null)" ||
+        print_error_and_exit "The archived app inode could not be inspected." 66
+    [ "$marker_authorized_placeholder_device" = "$placeholder_device" ] &&
+        [ "$marker_authorized_placeholder_inode" = "$placeholder_inode" ] ||
+        print_error_and_exit "The restoration authorization does not match the archived app identity." 65
+    [ "$marker_authorized_restored_path" = "$restored_physical" ] ||
+        print_error_and_exit "The restoration authorization does not match the restored app path." 65
+    [[ "$marker_authorized_device" =~ ^[0-9]+$ ]] ||
+        print_error_and_exit "The restored app authorization device is invalid." 65
+    [[ "$marker_authorized_inode" =~ ^[0-9]+$ ]] ||
+        print_error_and_exit "The restored app authorization inode is invalid." 65
+    local restored_device
+    local restored_inode
+    restored_device="$("$STAT_PATH" -f '%d' "$restored" 2>/dev/null)" ||
+        print_error_and_exit "The restored app device could not be inspected." 66
+    restored_inode="$("$STAT_PATH" -f '%i' "$restored" 2>/dev/null)" ||
+        print_error_and_exit "The restored app inode could not be inspected." 66
+    [ "$marker_authorized_device" = "$restored_device" ] &&
+        [ "$marker_authorized_inode" = "$restored_inode" ] ||
+        print_error_and_exit "The restoration authorization does not match the restored app identity." 65
+    [[ "$marker_restored_file_name" == *.app ]] ||
+        print_error_and_exit "The restored app authorization name is invalid." 65
+    if [ "$operation" = "prepare-restored" ] ||
+        [ "$operation" = "prepare-installed" ]; then
+        [ "$marker_restored_file_name" = "${restored_physical##*/}" ] ||
+            print_error_and_exit "The restoration authorization does not match the restored app name." 65
+    fi
+    [[ "$marker_security_state_specified" =~ ^(true|false)$ ]] ||
+        print_error_and_exit "The launch-security authorization state is invalid." 65
+    [[ "$marker_quarantine_present" =~ ^(true|false)$ ]] ||
+        print_error_and_exit "The quarantine authorization state is invalid." 65
+    [[ "$marker_provenance_present" =~ ^(true|false)$ ]] ||
+        print_error_and_exit "The provenance authorization state is invalid." 65
+    [[ "$marker_quarantine_hex" =~ ^[0-9a-f]*$ ]] ||
+        print_error_and_exit "The quarantine authorization value is invalid." 65
+    [[ "$marker_provenance_hex" =~ ^[0-9a-f]*$ ]] ||
+        print_error_and_exit "The provenance authorization value is invalid." 65
+    [ $((${#marker_quarantine_hex} % 2)) -eq 0 ] &&
+        [ "${#marker_quarantine_hex}" -le 32768 ] ||
+        print_error_and_exit "The quarantine authorization value is invalid." 65
+    [ $((${#marker_provenance_hex} % 2)) -eq 0 ] &&
+        [ "${#marker_provenance_hex}" -le 32768 ] ||
+        print_error_and_exit "The provenance authorization value is invalid." 65
+    if [ "$marker_security_state_specified" = "false" ]; then
+        [ "$marker_quarantine_present" = "false" ] &&
+            [ -z "$marker_quarantine_hex" ] &&
+            [ "$marker_provenance_present" = "false" ] &&
+            [ -z "$marker_provenance_hex" ] ||
+            print_error_and_exit "The legacy launch-security authorization state is invalid." 65
+    else
+        [ "$marker_quarantine_present" = "true" ] ||
+            [ -z "$marker_quarantine_hex" ] ||
+            print_error_and_exit "The absent quarantine value must be empty." 65
+        [ "$marker_provenance_present" = "true" ] ||
+            [ -z "$marker_provenance_hex" ] ||
+            print_error_and_exit "The absent provenance value must be empty." 65
+    fi
+
+    local placeholder_archive_identifier
+    local expected_bundle_id
+    local restored_bundle_id
+    local restored_placeholder
+    placeholder_archive_identifier="$("$PLISTBUDDY_PATH" -c "Print AppArchiverArchiveIdentifier" "$placeholder/Contents/Info.plist" 2>/dev/null)" ||
+        print_error_and_exit "The archived app is missing its archive identity." 66
+    expected_bundle_id="$("$PLISTBUDDY_PATH" -c "Print AppArchiverOriginalBundleIdentifier" "$placeholder/Contents/Info.plist" 2>/dev/null)" ||
+        print_error_and_exit "The archived app is missing its original identity." 66
+    restored_bundle_id="$(bundle_identifier "$restored")"
+    restored_placeholder="$("$PLISTBUDDY_PATH" -c "Print AppArchiverPlaceholder" "$restored/Contents/Info.plist" 2>/dev/null || true)"
+    [ -n "$placeholder_archive_identifier" ] ||
+        print_error_and_exit "The archived app has an invalid archive identity." 65
+    [ "$marker_archive_identifier" = "$placeholder_archive_identifier" ] ||
+        print_error_and_exit "The restoration authorization does not match the archive identity." 65
+    [ "$marker_original_bundle_id" = "$expected_bundle_id" ] ||
+        print_error_and_exit "The restoration authorization does not match the original app identity." 65
+    [ "$restored_bundle_id" = "$expected_bundle_id" ] ||
+        print_error_and_exit "The restored app does not match the archived app." 65
+    [ "$restored_placeholder" != "true" ] ||
+        print_error_and_exit "The restored staging still contains an archived launcher." 65
+
+    remove_quarantine_recursively_fast "$restored" ||
+        print_error_and_exit "The restored app's inherited launch restriction could not be removed." 67
+    if [ "$marker_security_state_specified" = "true" ]; then
+        restore_root_security_attribute "$restored" \
+            "com.apple.quarantine" \
+            "$marker_quarantine_present" \
+            "$marker_quarantine_hex" ||
+            print_error_and_exit "The restored app's quarantine state could not be restored." 67
+        # Provenance is controlled by macOS. Keep it whenever macOS provides
+        # it, but never remove, rewrite, or require its opaque value.
+    else
+        verify_quarantine_is_absent_recursively "$restored" ||
+            print_error_and_exit "The restored app's inherited launch restriction could not be removed." 67
+    fi
+
+    [ ! -L "$restored" ] ||
+        print_error_and_exit "The restored app identity changed during preparation." 67
+    local final_restored_device
+    local final_restored_inode
+    final_restored_device="$("$STAT_PATH" -f '%d' "$restored" 2>/dev/null)" ||
+        print_error_and_exit "The prepared restored app device could not be inspected." 67
+    final_restored_inode="$("$STAT_PATH" -f '%i' "$restored" 2>/dev/null)" ||
+        print_error_and_exit "The prepared restored app inode could not be inspected." 67
+    [ "$marker_authorized_device" = "$final_restored_device" ] &&
+        [ "$marker_authorized_inode" = "$final_restored_inode" ] ||
+        print_error_and_exit "The restored app identity changed during preparation." 67
+    [ ! -L "$placeholder" ] ||
+        print_error_and_exit "The archived app identity changed during preparation." 67
+    [ "$marker_authorized_placeholder_device" = \
+        "$("$STAT_PATH" -f '%d' "$placeholder" 2>/dev/null)" ] &&
+        [ "$marker_authorized_placeholder_inode" = \
+            "$("$STAT_PATH" -f '%i' "$placeholder" 2>/dev/null)" ] ||
+        print_error_and_exit "The archived app identity changed during preparation." 67
+
+    print_kv "status" "ok"
+    print_kv "script_version" "$SCRIPT_VERSION"
+    print_kv "bundle_id" "$restored_bundle_id"
+}
+
+create_optimized_copy() {
+    local source="${1:-}"
+    local destination="${2:-}"
+    source="${source%/}"
+    destination="${destination%/}"
+
+    [ -n "$source" ] || print_error_and_exit "Missing source app bundle path." 64
+    [ -n "$destination" ] || print_error_and_exit "Missing destination app bundle path." 64
+    is_app_bundle "$source" || print_error_and_exit "Source is not an app bundle." 65
+    [[ "$destination" == *.app ]] || print_error_and_exit "Destination is not an app bundle path." 65
+    [ "$source" != "$destination" ] || print_error_and_exit "Source and destination must be different." 65
+    [ ! -e "$destination" ] || print_error_and_exit "Destination already exists." 66
+    [ -d "$(dirname "$destination")" ] || print_error_and_exit "Destination folder does not exist." 66
+
+    if ! "$DITTO_PATH" \
+        --rsrc \
+        --extattr \
+        --acl \
+        --qtn \
+        --hfsCompression \
+        --nopreserveHFSCompression \
+        --noclone \
+        "$source" \
+        "$destination" >/dev/null 2>&1; then
+        print_error_and_exit "macOS could not create the filesystem-compressed copy." 70
+    fi
+
+    # macOS can write valid com.apple.decmpfs data without setting the
+    # UF_COMPRESSED flag. App Sandbox cannot finalize that flag. A physical
+    # recursive traversal avoids following symlinks outside the staged app.
+    # chflags leaves ordinary files unchanged and finalizes compressed files.
+    if ! "$CHFLAGS_PATH" -R -P -x compressed "$destination" >/dev/null 2>&1; then
+        print_error_and_exit "macOS could not finalize the filesystem-compressed copy." 71
+    fi
+
+    is_app_bundle "$destination" || print_error_and_exit "The optimized copy is incomplete." 72
+    print_kv "status" "ok"
+    print_kv "script_version" "$SCRIPT_VERSION"
+}
+
+extract_dmg_application() {
+    local source="${1:-}"
+    local destination="${2:-}"
+    source="${source%/}"
+    destination="${destination%/}"
+
+    [ -n "$source" ] || print_error_and_exit "Missing authenticated disk image path." 64
+    [ -n "$destination" ] || print_error_and_exit "Missing extraction destination path." 64
+    [[ "$source" == /* ]] || print_error_and_exit "The disk image path must be absolute." 65
+    [[ "$destination" == /* ]] || print_error_and_exit "The extraction path must be absolute." 65
+    case "$source$destination" in
+    *$'\n'* | *$'\r'*)
+        print_error_and_exit "The disk image extraction path is invalid." 65
+        ;;
+    esac
+    [ "${source##*/}" = "Authenticated Backup.dmg" ] ||
+        print_error_and_exit "The disk image staging name is invalid." 65
+    [ "${destination##*/}" = "Extracted" ] ||
+        print_error_and_exit "The extraction destination name is invalid." 65
+    [ ! -L "$source" ] && [ -f "$source" ] ||
+        print_error_and_exit "The authenticated disk image is invalid." 65
+    [ ! -e "$destination" ] && [ ! -L "$destination" ] ||
+        print_error_and_exit "The extraction destination already exists." 66
+
+    local source_parent="${source%/*}"
+    local destination_parent="${destination%/*}"
+    [ "$source_parent" = "$destination_parent" ] ||
+        print_error_and_exit "The disk image and extraction destination must share private staging." 65
+    local physical_parent
+    physical_parent="$(cd -P "$source_parent" 2>/dev/null && pwd -P)" ||
+        print_error_and_exit "The private extraction workspace is unavailable." 66
+    [ ! -L "$source_parent" ] && [ -d "$physical_parent" ] ||
+        print_error_and_exit "The private extraction workspace is invalid." 65
+    source="$physical_parent/${source##*/}"
+    destination="$physical_parent/${destination##*/}"
+    source_parent="$physical_parent"
+
+    local current_user
+    local parent_owner
+    local source_owner
+    local source_links
+    current_user="$($ID_PATH -u)" ||
+        print_error_and_exit "The current user could not be identified." 66
+    parent_owner="$($STAT_PATH -f '%u' "$source_parent" 2>/dev/null)" ||
+        print_error_and_exit "The private extraction workspace could not be inspected." 66
+    source_owner="$($STAT_PATH -f '%u' "$source" 2>/dev/null)" ||
+        print_error_and_exit "The authenticated disk image could not be inspected." 66
+    source_links="$($STAT_PATH -f '%l' "$source" 2>/dev/null)" ||
+        print_error_and_exit "The authenticated disk image links could not be inspected." 66
+    [ "$parent_owner" = "$current_user" ] &&
+        [ "$source_owner" = "$current_user" ] &&
+        [ "$source_links" = "1" ] ||
+        print_error_and_exit "The authenticated disk image ownership is invalid." 65
+
+    "$HDIUTIL_PATH" verify "$source" >/dev/null 2>&1 ||
+        print_error_and_exit "The disk image failed integrity verification." 67
+
+    local mount_point="$source_parent/.AppArchiver-DMG-Mount-$$-$RANDOM"
+    [ ! -e "$mount_point" ] ||
+        print_error_and_exit "A private disk image mount path already exists." 66
+    /bin/mkdir -m 700 "$mount_point" ||
+        print_error_and_exit "The private disk image mount path could not be created." 66
+    DMG_MOUNT_POINT="$mount_point"
+    if ! "$HDIUTIL_PATH" attach -readonly -nobrowse -noautoopen \
+        -mountpoint "$mount_point" "$source" >/dev/null 2>&1; then
+        print_error_and_exit "The verified disk image could not be mounted." 67
+    fi
+
+    local selected_app=""
+    local candidate
+    local LC_ALL=C
+    shopt -s nullglob
+    for candidate in "$mount_point"/*.app; do
+        if [ ! -L "$candidate" ] && is_app_bundle "$candidate"; then
+            selected_app="$candidate"
+            break
+        fi
+    done
+    shopt -u nullglob
+    if [ -z "$selected_app" ]; then
+        print_error_and_exit "The disk image does not contain an app at its root." 68
+    fi
+
+    /bin/mkdir -m 700 "$destination" || {
+        print_error_and_exit "The extraction destination could not be created." 69
+    }
+    DMG_EXTRACTION_DESTINATION="$destination"
+    local extracted_app="$destination/${selected_app##*/}"
+    if ! "$DITTO_PATH" --rsrc --extattr --acl --noqtn \
+        "$selected_app" "$extracted_app" >/dev/null 2>&1; then
+        print_error_and_exit "The app could not be extracted from the disk image." 69
+    fi
+    if ! "$HDIUTIL_PATH" detach "$mount_point" >/dev/null 2>&1; then
+        print_error_and_exit "The disk image could not be detached safely." 70
+    fi
+    /bin/rmdir "$mount_point" >/dev/null 2>&1 ||
+        print_error_and_exit "The private disk image mount path could not be removed." 70
+    DMG_MOUNT_POINT=""
+    is_app_bundle "$extracted_app" || {
+        print_error_and_exit "The extracted application is incomplete." 71
+    }
+    DMG_EXTRACTION_DESTINATION=""
+
+    print_kv "status" "ok"
+    print_kv "script_version" "$SCRIPT_VERSION"
+}
+
+backup_application_operation() {
+    local operation="${1:-}"
+    local source="${2:-}"
+    local destination="${3:-}"
+    local expected_device="${4:-}"
+    local expected_inode="${5:-}"
+    source="${source%/}"
+    destination="${destination%/}"
+
+    case "$operation" in
+    backup-move-source | backup-restore-source | backup-remove-recovery | backup-prepare-installed)
+        ;;
+    *)
+        print_error_and_exit "The backup application operation is invalid." 64
+        ;;
+    esac
+    is_app_bundle "$source" ||
+        print_error_and_exit "The authenticated source app is invalid." 65
+    [ ! -L "$source" ] ||
+        print_error_and_exit "The authenticated source app cannot be a symbolic link." 65
+    [[ "$expected_device" =~ ^[0-9]+$ ]] &&
+        [[ "$expected_inode" =~ ^[0-9]+$ ]] &&
+        [ "$expected_device" -gt 0 ] && [ "$expected_inode" -gt 0 ] ||
+        print_error_and_exit "The authenticated source identity is invalid." 65
+
+    local source_physical
+    local source_parent
+    local source_name
+    local source_device
+    local source_inode
+    source_physical="$(physical_existing_path "$source")" ||
+        print_error_and_exit "The authenticated source path could not be resolved." 66
+    source_parent="${source_physical%/*}"
+    source_name="${source_physical##*/}"
+    source_device="$($STAT_PATH -f '%d' "$source_physical" 2>/dev/null)" ||
+        print_error_and_exit "The authenticated source device could not be inspected." 66
+    source_inode="$($STAT_PATH -f '%i' "$source_physical" 2>/dev/null)" ||
+        print_error_and_exit "The authenticated source inode could not be inspected." 66
+    [ "$source_device" = "$expected_device" ] &&
+        [ "$source_inode" = "$expected_inode" ] ||
+        print_error_and_exit "The installed app changed before the authenticated operation." 67
+
+    case "$operation" in
+    backup-move-source)
+        [[ "$source_name" == *.app ]] && [[ "$source_name" != .* ]] ||
+            print_error_and_exit "The installed app name is invalid." 65
+        ;;
+    backup-prepare-installed)
+        [[ "$source_name" == *.app ]] && [[ "$source_name" != .* ]] ||
+            print_error_and_exit "The installed restored app name is invalid." 65
+        ;;
+    backup-restore-source | backup-remove-recovery)
+        [[ "$source_name" == .apparchiver-recovery-*.app ]] ||
+            print_error_and_exit "The recovery app name is invalid." 65
+        ;;
+    esac
+
+    if [ "$operation" = "backup-prepare-installed" ]; then
+        local provenance_status=0
+        root_attribute_is_present "$source_physical" "com.apple.provenance" ||
+            provenance_status=$?
+        if [ "$provenance_status" -eq 2 ]; then
+            print_error_and_exit "The installed app provenance could not be inspected." 68
+        fi
+        if [ "$provenance_status" -ne 0 ]; then
+            remove_quarantine_recursively_fast "$source_physical" ||
+                print_error_and_exit "The installed app quarantine could not be removed." 68
+            verify_quarantine_is_absent_recursively "$source_physical" ||
+                print_error_and_exit "The installed app quarantine removal could not be verified." 68
+        fi
+        local prepared_device
+        local prepared_inode
+        prepared_device="$($STAT_PATH -f '%d' "$source_physical" 2>/dev/null)" ||
+            print_error_and_exit "The prepared app device could not be verified." 69
+        prepared_inode="$($STAT_PATH -f '%i' "$source_physical" 2>/dev/null)" ||
+            print_error_and_exit "The prepared app inode could not be verified." 69
+        [ "$prepared_device" = "$expected_device" ] &&
+            [ "$prepared_inode" = "$expected_inode" ] ||
+            print_error_and_exit "The installed app changed while its launch-security state was prepared." 69
+        print_kv "status" "ok"
+        print_kv "script_version" "$SCRIPT_VERSION"
+        return
+    fi
+
+    if [ "$operation" = "backup-remove-recovery" ]; then
+        /bin/rm -rf "$source_physical" ||
+            print_error_and_exit "The committed recovery app could not be removed." 68
+        [ ! -e "$source_physical" ] && [ ! -L "$source_physical" ] ||
+            print_error_and_exit "The committed recovery app was not removed completely." 68
+        print_kv "status" "ok"
+        print_kv "script_version" "$SCRIPT_VERSION"
+        return
+    fi
+
+    [ -n "$destination" ] && [ "$destination" != "-" ] ||
+        print_error_and_exit "The source-removal destination is missing." 64
+    [[ "$destination" == /* ]] && [[ "$destination" == *.app ]] ||
+        print_error_and_exit "The source-removal destination is invalid." 65
+    case "$destination" in
+    *$'\n'* | *$'\r'*)
+        print_error_and_exit "The source-removal destination is invalid." 65
+        ;;
+    esac
+    [ ! -e "$destination" ] && [ ! -L "$destination" ] ||
+        print_error_and_exit "The source-removal destination already exists." 65
+
+    local destination_parent
+    local destination_name
+    local destination_physical_parent
+    destination_parent="${destination%/*}"
+    destination_name="${destination##*/}"
+    destination_physical_parent="$(cd -P "$destination_parent" 2>/dev/null && pwd -P)" ||
+        print_error_and_exit "The source-removal destination folder could not be resolved." 66
+    [ "$source_parent" = "$destination_physical_parent" ] ||
+        print_error_and_exit "The source and recovery app must share one physical folder." 65
+    if [ "$operation" = "backup-move-source" ]; then
+        [[ "$destination_name" == .apparchiver-recovery-*.app ]] ||
+            print_error_and_exit "The recovery app name is invalid." 65
+    else
+        [[ "$destination_name" == *.app ]] && [[ "$destination_name" != .* ]] ||
+            print_error_and_exit "The restored app name is invalid." 65
+    fi
+
+    /bin/mv "$source_physical" "$destination" ||
+        print_error_and_exit "The authenticated app could not be moved atomically." 68
+    local moved_device
+    local moved_inode
+    moved_device="$($STAT_PATH -f '%d' "$destination" 2>/dev/null)" ||
+        print_error_and_exit "The moved app device could not be verified." 69
+    moved_inode="$($STAT_PATH -f '%i' "$destination" 2>/dev/null)" ||
+        print_error_and_exit "The moved app inode could not be verified." 69
+    [ "$moved_device" = "$expected_device" ] &&
+        [ "$moved_inode" = "$expected_inode" ] &&
+        [ ! -e "$source_physical" ] && [ ! -L "$source_physical" ] ||
+        print_error_and_exit "The moved app identity could not be verified." 69
+
+    print_kv "status" "ok"
+    print_kv "script_version" "$SCRIPT_VERSION"
+}
+
+case "${1:-}" in
+version)
+    print_kv "status" "ok"
+    print_kv "script_version" "$SCRIPT_VERSION"
+    ;;
+approve)
+    approve_bundle "${2:-}"
+    ;;
+prepare-restored)
+    prepare_restored_bundle "prepare-restored" "${2:-}" "${3:-}" "${4:-}" "${5:-}"
+    ;;
+prepare-relocated)
+    prepare_restored_bundle "prepare-relocated" "${2:-}" "${3:-}" "${4:-}" "${5:-}"
+    ;;
+prepare-installed)
+    prepare_restored_bundle "prepare-installed" "${2:-}" "${3:-}" "${4:-}" "${5:-}"
+    ;;
+optimize-copy)
+    create_optimized_copy "${2:-}" "${3:-}"
+    ;;
+extract-dmg-app)
+    extract_dmg_application "${2:-}" "${3:-}"
+    ;;
+backup-move-source | backup-restore-source | backup-remove-recovery | backup-prepare-installed)
+    backup_application_operation "${1:-}" "${2:-}" "${3:-}" "${4:-}" "${5:-}"
+    ;;
+*)
+    print_error_and_exit "Usage: $SCRIPT_NAME version | approve /path/to/Shortcut.app | prepare-restored /path/to/Archived.app /private/restored/App.app /private/restored/.AppArchiver-Restore-Authorization.plist token | prepare-relocated /path/to/Archived.app /path/to/.AppArchiver-Restored-UUID.app /private/restored/.AppArchiver-Restore-Authorization.plist token | prepare-installed /path/to/.AppArchiver-Restored-UUID.app /path/to/Original.app /private/restored/.AppArchiver-Restore-Authorization.plist token | optimize-copy /path/to/Source.app /path/to/Destination.app | extract-dmg-app /private/Authenticated\ Backup.dmg /private/Extracted | backup-move-source /path/to/App.app /path/to/.apparchiver-recovery-UUID.app device inode | backup-restore-source /path/to/.apparchiver-recovery-UUID.app /path/to/App.app device inode | backup-remove-recovery /path/to/.apparchiver-recovery-UUID.app - device inode | backup-prepare-installed /path/to/App.app - device inode" 64
+    ;;
+esac
