@@ -24,7 +24,7 @@ All app analysis, compression, archiving, backup, and restoration happen locally
 
 ## Requirements and limits
 
-- macOS 11 or later
+- macOS 12 or later
 - Access to the application folders and backup locations you select
 - App Management or administrator approval for some protected apps
 - The target app must be fully quit before it can be optimized, archived, or removed
