@@ -19,7 +19,7 @@ PATH="/usr/bin:/bin:/usr/sbin:/sbin"
 export PATH
 
 readonly SCRIPT_NAME="AppArchiverScript"
-readonly SCRIPT_VERSION="15"
+readonly SCRIPT_VERSION="16"
 readonly XATTR_PATH="/usr/bin/xattr"
 readonly FIND_PATH="/usr/bin/find"
 readonly PLISTBUDDY_PATH="/usr/libexec/PlistBuddy"
@@ -513,6 +513,17 @@ prepare_restored_bundle() {
 create_optimized_copy() {
     local source="${1:-}"
     local destination="${2:-}"
+    local ditto_error=""
+    local ditto_help=""
+    local ditto_status=0
+    local -a ditto_arguments=(
+        --rsrc
+        --extattr
+        --acl
+        --qtn
+        --hfsCompression
+        --nopreserveHFSCompression
+    )
     source="${source%/}"
     destination="${destination%/}"
 
@@ -524,17 +535,33 @@ create_optimized_copy() {
     [ ! -e "$destination" ] || print_error_and_exit "Destination already exists." 66
     [ -d "$(dirname "$destination")" ] || print_error_and_exit "Destination folder does not exist." 66
 
-    if ! "$DITTO_PATH" \
-        --rsrc \
-        --extattr \
-        --acl \
-        --qtn \
-        --hfsCompression \
-        --nopreserveHFSCompression \
-        --noclone \
-        "$source" \
-        "$destination" >/dev/null 2>&1; then
-        print_error_and_exit "macOS could not create the filesystem-compressed copy." 70
+    # File cloning and the matching --noclone option were added to ditto
+    # after the filesystem-compression options. Older macOS releases do not
+    # advertise the option and already perform a physical copy by default.
+    ditto_help="$("$DITTO_PATH" --help 2>&1 || true)"
+    if [[ "$ditto_help" == *"--noclone"* ]]; then
+        ditto_arguments+=(--noclone)
+    fi
+
+    ditto_error="$(
+        "$DITTO_PATH" \
+            "${ditto_arguments[@]}" \
+            "$source" \
+            "$destination" \
+            2>&1 >/dev/null
+    )" || ditto_status=$?
+    if [ "$ditto_status" -ne 0 ]; then
+        ditto_error="${ditto_error//$'\r'/ }"
+        ditto_error="${ditto_error//$'\n'/ }"
+        ditto_error="${ditto_error:0:512}"
+        if [ -n "$ditto_error" ]; then
+            print_error_and_exit \
+                "macOS could not create the filesystem-compressed copy. $ditto_error" \
+                70
+        fi
+        print_error_and_exit \
+            "macOS could not create the filesystem-compressed copy." \
+            70
     fi
 
     # macOS can write valid com.apple.decmpfs data without setting the
