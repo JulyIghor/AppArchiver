@@ -9,9 +9,10 @@
 #   ~/Library/Application Scripts/com.apparchiver.mac/AppArchiverScript
 #
 # This helper performs the narrow operations that App Sandbox cannot perform.
-# It removes quarantine from generated shortcut bundles and verified restored
-# app staging, creates disposable filesystem-compressed app copies, and safely
-# extracts one app from authenticated disk image staging.
+# It removes quarantine from generated shortcut bundles, preserves authenticated
+# launch-security state on restored apps, records explicit user installations,
+# creates disposable filesystem-compressed copies, and safely extracts one app
+# from authenticated disk image staging.
 
 set -u
 set -o pipefail
@@ -19,7 +20,7 @@ PATH="/usr/bin:/bin:/usr/sbin:/sbin"
 export PATH
 
 readonly SCRIPT_NAME="AppArchiverScript"
-readonly SCRIPT_VERSION="16"
+readonly SCRIPT_VERSION="18"
 readonly XATTR_PATH="/usr/bin/xattr"
 readonly FIND_PATH="/usr/bin/find"
 readonly PLISTBUDDY_PATH="/usr/libexec/PlistBuddy"
@@ -60,6 +61,13 @@ print_kv() {
 
 print_error_and_exit() {
     print_kv "status" "error"
+    print_kv "error" "$1"
+    exit "${2:-1}"
+}
+
+print_permission_error_and_exit() {
+    print_kv "status" "error"
+    print_kv "permission_denied" "true"
     print_kv "error" "$1"
     exit "${2:-1}"
 }
@@ -183,6 +191,49 @@ restore_root_security_attribute() {
     root_attribute_is_present "$target" "$attribute_name"
     local presence_status=$?
     [ "$presence_status" -eq 1 ]
+}
+
+record_user_installation_state() {
+    local target="${1:-}"
+    local quarantine_value=""
+    local quarantine_status=0
+    local quarantine_flags=""
+    local installed_flags=""
+    local installed_value=""
+    local verified_value=""
+
+    quarantine_value=$("$XATTR_PATH" -p com.apple.quarantine \
+        "$target" 2>/dev/null)
+    quarantine_status="$?"
+    if [ "$quarantine_status" -ne 0 ]; then
+        root_attribute_is_present "$target" "com.apple.quarantine"
+        [ "$?" -eq 1 ]
+        return
+    fi
+
+    quarantine_flags="${quarantine_value%%;*}"
+    [ "${#quarantine_flags}" -eq 4 ] &&
+        [ "${quarantine_value:4:1}" = ";" ] || return 1
+    case "$quarantine_flags" in
+    *[!0-9a-fA-F]*)
+        return 1
+        ;;
+    esac
+
+    # Finder records an explicit user move with the 0x0100 flag. Restoring an
+    # app is the equivalent user-approved action, so retain every other field
+    # and add only the state that prevents a read-only AppTranslocation launch.
+    installed_flags=$(printf '%04x' \
+        "$((16#$quarantine_flags | 16#0100))") || return 1
+    installed_value="${installed_flags}${quarantine_value:4}"
+    if [ "$installed_value" != "$quarantine_value" ]; then
+        "$XATTR_PATH" -w com.apple.quarantine "$installed_value" \
+            "$target" >/dev/null 2>&1 || return 1
+    fi
+
+    verified_value=$("$XATTR_PATH" -p com.apple.quarantine \
+        "$target" 2>/dev/null) || return 1
+    [ "$verified_value" = "$installed_value" ]
 }
 
 approve_bundle() {
@@ -485,6 +536,10 @@ prepare_restored_bundle() {
         verify_quarantine_is_absent_recursively "$restored" ||
             print_error_and_exit "The restored app's inherited launch restriction could not be removed." 67
     fi
+    if [ "$operation" = "prepare-installed" ]; then
+        record_user_installation_state "$restored" ||
+            print_error_and_exit "The restored app's user installation state could not be recorded." 67
+    fi
 
     [ ! -L "$restored" ] ||
         print_error_and_exit "The restored app identity changed during preparation." 67
@@ -753,6 +808,9 @@ backup_application_operation() {
                 print_error_and_exit "The installed app quarantine could not be removed." 68
             verify_quarantine_is_absent_recursively "$source_physical" ||
                 print_error_and_exit "The installed app quarantine removal could not be verified." 68
+        else
+            record_user_installation_state "$source_physical" ||
+                print_error_and_exit "The installed app's user installation state could not be recorded." 68
         fi
         local prepared_device
         local prepared_inode
@@ -770,7 +828,7 @@ backup_application_operation() {
 
     if [ "$operation" = "backup-remove-recovery" ]; then
         /bin/rm -rf "$source_physical" ||
-            print_error_and_exit "The committed recovery app could not be removed." 68
+            print_permission_error_and_exit "The committed recovery app could not be removed." 68
         [ ! -e "$source_physical" ] && [ ! -L "$source_physical" ] ||
             print_error_and_exit "The committed recovery app was not removed completely." 68
         print_kv "status" "ok"
@@ -808,7 +866,7 @@ backup_application_operation() {
     fi
 
     /bin/mv "$source_physical" "$destination" ||
-        print_error_and_exit "The authenticated app could not be moved atomically." 68
+        print_permission_error_and_exit "The authenticated app could not be moved atomically." 68
     local moved_device
     local moved_inode
     moved_device="$($STAT_PATH -f '%d' "$destination" 2>/dev/null)" ||
