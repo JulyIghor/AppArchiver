@@ -10,9 +10,8 @@
 #
 # This helper performs the narrow operations that App Sandbox cannot perform.
 # It removes quarantine from generated shortcut bundles, preserves authenticated
-# launch-security state on restored apps, records explicit user installations,
-# creates disposable filesystem-compressed copies, and safely extracts one app
-# from authenticated disk image staging.
+# launch-security state on restored apps, performs authenticated application
+# transactions, and safely extracts one app from disk image staging.
 
 set -u
 set -o pipefail
@@ -20,13 +19,11 @@ PATH="/usr/bin:/bin:/usr/sbin:/sbin"
 export PATH
 
 readonly SCRIPT_NAME="AppArchiverScript"
-readonly SCRIPT_VERSION="18"
 readonly XATTR_PATH="/usr/bin/xattr"
 readonly FIND_PATH="/usr/bin/find"
 readonly PLISTBUDDY_PATH="/usr/libexec/PlistBuddy"
 readonly PLUTIL_PATH="/usr/bin/plutil"
 readonly DITTO_PATH="/usr/bin/ditto"
-readonly CHFLAGS_PATH="/usr/bin/chflags"
 readonly HDIUTIL_PATH="/usr/bin/hdiutil"
 readonly STAT_PATH="/usr/bin/stat"
 readonly ID_PATH="/usr/bin/id"
@@ -254,7 +251,6 @@ approve_bundle() {
         print_error_and_exit "The generated app's launch restriction could not be removed." 67
 
     print_kv "status" "ok"
-    print_kv "script_version" "$SCRIPT_VERSION"
     print_kv "bundle_id" "$bundle_id"
 }
 
@@ -523,22 +519,34 @@ prepare_restored_bundle() {
         print_error_and_exit "The restored staging still contains an archived launcher." 65
 
     remove_quarantine_recursively_fast "$restored" ||
-        print_error_and_exit "The restored app's inherited launch restriction could not be removed." 67
+        if [ "$operation" = "prepare-installed" ]; then
+            print_permission_error_and_exit "The restored app's inherited launch restriction could not be removed." 67
+        else
+            print_error_and_exit "The restored app's inherited launch restriction could not be removed." 67
+        fi
     if [ "$marker_security_state_specified" = "true" ]; then
         restore_root_security_attribute "$restored" \
             "com.apple.quarantine" \
             "$marker_quarantine_present" \
             "$marker_quarantine_hex" ||
-            print_error_and_exit "The restored app's quarantine state could not be restored." 67
+            if [ "$operation" = "prepare-installed" ]; then
+                print_permission_error_and_exit "The restored app's quarantine state could not be restored." 67
+            else
+                print_error_and_exit "The restored app's quarantine state could not be restored." 67
+            fi
         # Provenance is controlled by macOS. Keep it whenever macOS provides
         # it, but never remove, rewrite, or require its opaque value.
     else
         verify_quarantine_is_absent_recursively "$restored" ||
-            print_error_and_exit "The restored app's inherited launch restriction could not be removed." 67
+            if [ "$operation" = "prepare-installed" ]; then
+                print_permission_error_and_exit "The restored app's inherited launch restriction could not be removed." 67
+            else
+                print_error_and_exit "The restored app's inherited launch restriction could not be removed." 67
+            fi
     fi
     if [ "$operation" = "prepare-installed" ]; then
         record_user_installation_state "$restored" ||
-            print_error_and_exit "The restored app's user installation state could not be recorded." 67
+            print_permission_error_and_exit "The restored app's user installation state could not be recorded." 67
     fi
 
     [ ! -L "$restored" ] ||
@@ -561,75 +569,7 @@ prepare_restored_bundle() {
         print_error_and_exit "The archived app identity changed during preparation." 67
 
     print_kv "status" "ok"
-    print_kv "script_version" "$SCRIPT_VERSION"
     print_kv "bundle_id" "$restored_bundle_id"
-}
-
-create_optimized_copy() {
-    local source="${1:-}"
-    local destination="${2:-}"
-    local ditto_error=""
-    local ditto_help=""
-    local ditto_status=0
-    local -a ditto_arguments=(
-        --rsrc
-        --extattr
-        --acl
-        --qtn
-        --hfsCompression
-        --nopreserveHFSCompression
-    )
-    source="${source%/}"
-    destination="${destination%/}"
-
-    [ -n "$source" ] || print_error_and_exit "Missing source app bundle path." 64
-    [ -n "$destination" ] || print_error_and_exit "Missing destination app bundle path." 64
-    is_app_bundle "$source" || print_error_and_exit "Source is not an app bundle." 65
-    [[ "$destination" == *.app ]] || print_error_and_exit "Destination is not an app bundle path." 65
-    [ "$source" != "$destination" ] || print_error_and_exit "Source and destination must be different." 65
-    [ ! -e "$destination" ] || print_error_and_exit "Destination already exists." 66
-    [ -d "$(dirname "$destination")" ] || print_error_and_exit "Destination folder does not exist." 66
-
-    # File cloning and the matching --noclone option were added to ditto
-    # after the filesystem-compression options. Older macOS releases do not
-    # advertise the option and already perform a physical copy by default.
-    ditto_help="$("$DITTO_PATH" --help 2>&1 || true)"
-    if [[ "$ditto_help" == *"--noclone"* ]]; then
-        ditto_arguments+=(--noclone)
-    fi
-
-    ditto_error="$(
-        "$DITTO_PATH" \
-            "${ditto_arguments[@]}" \
-            "$source" \
-            "$destination" \
-            2>&1 >/dev/null
-    )" || ditto_status=$?
-    if [ "$ditto_status" -ne 0 ]; then
-        ditto_error="${ditto_error//$'\r'/ }"
-        ditto_error="${ditto_error//$'\n'/ }"
-        ditto_error="${ditto_error:0:512}"
-        if [ -n "$ditto_error" ]; then
-            print_error_and_exit \
-                "macOS could not create the filesystem-compressed copy. $ditto_error" \
-                70
-        fi
-        print_error_and_exit \
-            "macOS could not create the filesystem-compressed copy." \
-            70
-    fi
-
-    # macOS can write valid com.apple.decmpfs data without setting the
-    # UF_COMPRESSED flag. App Sandbox cannot finalize that flag. A physical
-    # recursive traversal avoids following symlinks outside the staged app.
-    # chflags leaves ordinary files unchanged and finalizes compressed files.
-    if ! "$CHFLAGS_PATH" -R -P -x compressed "$destination" >/dev/null 2>&1; then
-        print_error_and_exit "macOS could not finalize the filesystem-compressed copy." 71
-    fi
-
-    is_app_bundle "$destination" || print_error_and_exit "The optimized copy is incomplete." 72
-    print_kv "status" "ok"
-    print_kv "script_version" "$SCRIPT_VERSION"
 }
 
 extract_dmg_application() {
@@ -736,7 +676,6 @@ extract_dmg_application() {
     DMG_EXTRACTION_DESTINATION=""
 
     print_kv "status" "ok"
-    print_kv "script_version" "$SCRIPT_VERSION"
 }
 
 backup_application_operation() {
@@ -749,7 +688,7 @@ backup_application_operation() {
     destination="${destination%/}"
 
     case "$operation" in
-    backup-move-source | backup-restore-source | backup-remove-recovery | backup-prepare-installed)
+    backup-move-source | backup-restore-source | backup-remove-recovery)
         ;;
     *)
         print_error_and_exit "The backup application operation is invalid." 64
@@ -786,45 +725,11 @@ backup_application_operation() {
         [[ "$source_name" == *.app ]] && [[ "$source_name" != .* ]] ||
             print_error_and_exit "The installed app name is invalid." 65
         ;;
-    backup-prepare-installed)
-        [[ "$source_name" == *.app ]] && [[ "$source_name" != .* ]] ||
-            print_error_and_exit "The installed restored app name is invalid." 65
-        ;;
     backup-restore-source | backup-remove-recovery)
         [[ "$source_name" == .apparchiver-recovery-*.app ]] ||
             print_error_and_exit "The recovery app name is invalid." 65
         ;;
     esac
-
-    if [ "$operation" = "backup-prepare-installed" ]; then
-        local provenance_status=0
-        root_attribute_is_present "$source_physical" "com.apple.provenance" ||
-            provenance_status=$?
-        if [ "$provenance_status" -eq 2 ]; then
-            print_error_and_exit "The installed app provenance could not be inspected." 68
-        fi
-        if [ "$provenance_status" -ne 0 ]; then
-            remove_quarantine_recursively_fast "$source_physical" ||
-                print_error_and_exit "The installed app quarantine could not be removed." 68
-            verify_quarantine_is_absent_recursively "$source_physical" ||
-                print_error_and_exit "The installed app quarantine removal could not be verified." 68
-        else
-            record_user_installation_state "$source_physical" ||
-                print_error_and_exit "The installed app's user installation state could not be recorded." 68
-        fi
-        local prepared_device
-        local prepared_inode
-        prepared_device="$($STAT_PATH -f '%d' "$source_physical" 2>/dev/null)" ||
-            print_error_and_exit "The prepared app device could not be verified." 69
-        prepared_inode="$($STAT_PATH -f '%i' "$source_physical" 2>/dev/null)" ||
-            print_error_and_exit "The prepared app inode could not be verified." 69
-        [ "$prepared_device" = "$expected_device" ] &&
-            [ "$prepared_inode" = "$expected_inode" ] ||
-            print_error_and_exit "The installed app changed while its launch-security state was prepared." 69
-        print_kv "status" "ok"
-        print_kv "script_version" "$SCRIPT_VERSION"
-        return
-    fi
 
     if [ "$operation" = "backup-remove-recovery" ]; then
         /bin/rm -rf "$source_physical" ||
@@ -832,7 +737,6 @@ backup_application_operation() {
         [ ! -e "$source_physical" ] && [ ! -L "$source_physical" ] ||
             print_error_and_exit "The committed recovery app was not removed completely." 68
         print_kv "status" "ok"
-        print_kv "script_version" "$SCRIPT_VERSION"
         return
     fi
 
@@ -879,14 +783,9 @@ backup_application_operation() {
         print_error_and_exit "The moved app identity could not be verified." 69
 
     print_kv "status" "ok"
-    print_kv "script_version" "$SCRIPT_VERSION"
 }
 
 case "${1:-}" in
-version)
-    print_kv "status" "ok"
-    print_kv "script_version" "$SCRIPT_VERSION"
-    ;;
 approve)
     approve_bundle "${2:-}"
     ;;
@@ -899,16 +798,13 @@ prepare-relocated)
 prepare-installed)
     prepare_restored_bundle "prepare-installed" "${2:-}" "${3:-}" "${4:-}" "${5:-}"
     ;;
-optimize-copy)
-    create_optimized_copy "${2:-}" "${3:-}"
-    ;;
 extract-dmg-app)
     extract_dmg_application "${2:-}" "${3:-}"
     ;;
-backup-move-source | backup-restore-source | backup-remove-recovery | backup-prepare-installed)
+backup-move-source | backup-restore-source | backup-remove-recovery)
     backup_application_operation "${1:-}" "${2:-}" "${3:-}" "${4:-}" "${5:-}"
     ;;
 *)
-    print_error_and_exit "Usage: $SCRIPT_NAME version | approve /path/to/Shortcut.app | prepare-restored /path/to/Archived.app /private/restored/App.app /private/restored/.AppArchiver-Restore-Authorization.plist token | prepare-relocated /path/to/Archived.app /path/to/.AppArchiver-Restored-UUID.app /private/restored/.AppArchiver-Restore-Authorization.plist token | prepare-installed /path/to/.AppArchiver-Restored-UUID.app /path/to/Original.app /private/restored/.AppArchiver-Restore-Authorization.plist token | optimize-copy /path/to/Source.app /path/to/Destination.app | extract-dmg-app /private/Authenticated\ Backup.dmg /private/Extracted | backup-move-source /path/to/App.app /path/to/.apparchiver-recovery-UUID.app device inode | backup-restore-source /path/to/.apparchiver-recovery-UUID.app /path/to/App.app device inode | backup-remove-recovery /path/to/.apparchiver-recovery-UUID.app - device inode | backup-prepare-installed /path/to/App.app - device inode" 64
+    print_error_and_exit "Usage: $SCRIPT_NAME approve /path/to/Shortcut.app | prepare-restored /path/to/Archived.app /private/restored/App.app /private/restored/.AppArchiver-Restore-Authorization.plist token | prepare-relocated /path/to/Archived.app /path/to/.AppArchiver-Restored-UUID.app /private/restored/.AppArchiver-Restore-Authorization.plist token | prepare-installed /path/to/.AppArchiver-Restored-UUID.app /path/to/Original.app /private/restored/.AppArchiver-Restore-Authorization.plist token | extract-dmg-app /private/Authenticated\ Backup.dmg /private/Extracted | backup-move-source /path/to/App.app /path/to/.apparchiver-recovery-UUID.app device inode | backup-restore-source /path/to/.apparchiver-recovery-UUID.app /path/to/App.app device inode | backup-remove-recovery /path/to/.apparchiver-recovery-UUID.app - device inode" 64
     ;;
 esac

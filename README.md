@@ -26,14 +26,13 @@ All app analysis, compression, archiving, backup, and restoration happen locally
 
 - macOS 12 or later
 - Access to the application folders and backup locations you select
-- App Management or administrator approval for some protected apps
 - The target app must be fully quit before it can be optimized, archived, or removed
 
 System apps cannot be archived. An app must be restored before it can run or update. Updating an optimized app may replace its compressed files, after which it can be optimized again.
 
 ## AppArchiverScript helper
 
-This repository includes the readable [AppArchiverScript helper](components/AppArchiverScript) used by App Archiver for the narrow file operations that the App Sandbox cannot perform. These operations include creating disposable filesystem-compressed app copies, preparing authenticated restorations, extracting one app from authenticated DMG staging, and removing launch quarantine from generated restorable apps.
+This repository includes the readable [AppArchiverScript helper](components/AppArchiverScript) used by App Archiver for the narrow file operations that the App Sandbox cannot perform. These operations include preparing authenticated restorations, performing authenticated app transactions, extracting one app from authenticated DMG staging, and removing launch quarantine from generated restorable apps.
 
 App Archiver runs the helper locally and only when one of these operations needs it. For normal installation, use the helper installation prompt inside App Archiver. It saves the executable script at the following location.
 
