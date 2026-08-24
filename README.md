@@ -30,11 +30,15 @@ All app analysis, compression, archiving, backup, and restoration happen locally
 
 System apps cannot be archived. An app must be restored before it can run or update. Updating an optimized app may replace its compressed files, after which it can be optimized again.
 
-## AppArchiverScript helper
+## Optional AppArchiverScript helper
 
-This repository includes the readable [AppArchiverScript helper](components/AppArchiverScript) used by App Archiver for the narrow file operations that the App Sandbox cannot perform. These operations include preparing authenticated restorations, performing authenticated app transactions, extracting one app from authenticated DMG staging, and removing launch quarantine from generated restorable apps.
+App Archiver includes every feature and works fully without the [AppArchiverScript helper](components/AppArchiverScript). Installing the helper does not unlock features or expand what App Archiver can do.
 
-App Archiver runs the helper locally and only when one of these operations needs it. For normal installation, use the helper installation prompt inside App Archiver. It saves the executable script at the following location.
+The helper is an optional convenience that automates macOS approval for the restorable archived app bundles created by App Archiver. It verifies that a target is one of these special archive bundles and cannot approve regular apps, other app bundles, files, or anything else.
+
+Without the helper, you can use every App Archiver feature and manually approve a restorable archived app bundle when macOS asks. Installing the helper only automates that approval step.
+
+Use the helper installation prompt inside App Archiver if you want this automation. It saves the executable script at the following location.
 
 ```text
 ~/Library/Application Scripts/com.apparchiver.mac/AppArchiverScript
@@ -42,7 +46,7 @@ App Archiver runs the helper locally and only when one of these operations needs
 
 Keep the helper name and contents unchanged. App Archiver checks that the installed helper exactly matches its bundled copy and that it is executable. Reinstall or update the helper from the app when prompted so its version matches the installed app.
 
-The helper command interface is an implementation detail intended for App Archiver. Running its file operations directly is not needed for normal use.
+The helper command interface is an implementation detail intended for App Archiver. Running it directly is not needed for normal use.
 
 ## Helper license
 
