@@ -664,6 +664,23 @@ extract_dmg_application() {
         "$selected_app" "$extracted_app" >/dev/null 2>&1; then
         print_error_and_exit "The app could not be extracted from the disk image." 69
     fi
+    # Data is a separate, optional payload. The sandboxed host verifies it
+    # before offering restoration. Never follow a Data-directory symlink.
+    if [ -d "$mount_point/Data" ] && [ ! -L "$mount_point/Data" ]; then
+        if ! "$DITTO_PATH" --rsrc --extattr --acl \
+            "$mount_point/Data" "$destination/Data" >/dev/null 2>&1; then
+            # Keep the verified app. Leave the partial Data directory for the
+            # host to reject and report independently after app installation.
+            /bin/mkdir -p "$destination/Data"
+            printf '%s\n' 'Incomplete optional data extraction' > "$destination/Data/.AppArchiverDataExtractionFailed"
+            printf '%s\n' 'The optional app data could not be extracted completely.' >&2
+        fi
+    elif [ -e "$mount_point/Data" ] || [ -L "$mount_point/Data" ]; then
+        # A Data symlink or non-directory is never followed. An empty marker
+        # makes the separate data failure visible even for an imported DMG
+        # which has no App Archiver sidecar metadata.
+        /bin/mkdir -p "$destination/Data"
+    fi
     if ! "$HDIUTIL_PATH" detach "$mount_point" >/dev/null 2>&1; then
         print_error_and_exit "The disk image could not be detached safely." 70
     fi
@@ -688,7 +705,7 @@ backup_application_operation() {
     destination="${destination%/}"
 
     case "$operation" in
-    backup-move-source | backup-restore-source | backup-remove-recovery)
+    backup-move-source | backup-restore-source | backup-remove-recovery | backup-record-installation)
         ;;
     *)
         print_error_and_exit "The backup application operation is invalid." 64
@@ -719,6 +736,20 @@ backup_application_operation() {
     [ "$source_device" = "$expected_device" ] &&
         [ "$source_inode" = "$expected_inode" ] ||
         print_error_and_exit "The installed app changed before the authenticated operation." 67
+
+    if [ "$operation" = "backup-record-installation" ]; then
+        [ "$destination" = "-" ] ||
+            print_error_and_exit "Recording an installation does not accept a destination." 65
+        record_user_installation_state "$source_physical" ||
+            print_permission_error_and_exit "The restored app's user installation state could not be recorded." 67
+        [ ! -L "$source" ] && [ ! -L "$source_physical" ] &&
+            [ "$(physical_existing_path "$source")" = "$source_physical" ] &&
+            [ "$("$STAT_PATH" -f '%d' "$source_physical")" = "$expected_device" ] &&
+            [ "$("$STAT_PATH" -f '%i' "$source_physical")" = "$expected_inode" ] ||
+            print_error_and_exit "The installed app changed while recording its installation state." 67
+        print_kv "status" "ok"
+        return
+    fi
 
     case "$operation" in
     backup-move-source)
@@ -801,7 +832,7 @@ prepare-installed)
 extract-dmg-app)
     extract_dmg_application "${2:-}" "${3:-}"
     ;;
-backup-move-source | backup-restore-source | backup-remove-recovery)
+backup-move-source | backup-restore-source | backup-remove-recovery | backup-record-installation)
     backup_application_operation "${1:-}" "${2:-}" "${3:-}" "${4:-}" "${5:-}"
     ;;
 *)
