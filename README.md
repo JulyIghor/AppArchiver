@@ -4,7 +4,7 @@ App Archiver is a macOS utility for reclaiming lasting disk space from apps you 
 
 [Visit the App Archiver website](https://apparchiver.com) or [view App Archiver on the Mac App Store](https://apps.apple.com/app/id6794885091).
 
-![App Archiver storage overview](https://apparchiver.com/screenshots/01-overview.png)
+![App Archiver storage overview](https://apparchiver.com/screenshots/01-overview.webp)
 
 ## What App Archiver does
 
